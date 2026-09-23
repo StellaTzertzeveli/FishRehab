@@ -1,8 +1,3 @@
-"""
-Lightweight entity classes for everything that swims/floats in the pond.
-Each entity knows its own position, drift motion, and hit-radius; the
-game loop is responsible for spawning, drawing, and hit-testing them.
-"""
 
 import random
 from dataclasses import dataclass, field
@@ -11,7 +6,7 @@ import config
 
 @dataclass
 class Entity:
-    name: str          # asset key, e.g. "banana_trash"
+    name: str
     x: float
     y: float
     size: int
@@ -40,7 +35,7 @@ class Entity:
 
 
 def spawn_debris(frame_w: int, frame_h: int) -> Entity:
-    name = random.choice(["banana_trash", "soda_trash"])
+    name = random.choice(["banana_trash", "soda_trash", "apple_trash", "bones_trash"])
     return Entity(
         name=name,
         x=random.uniform(config.TRASH_SIZE, frame_w - config.TRASH_SIZE),

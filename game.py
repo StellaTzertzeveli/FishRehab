@@ -1,202 +1,844 @@
-"""
-The Game class owns all mutable state: current phase, entities on
-screen, score, and per-entity cooldown timers. `Game.update()` is
-called once per frame with the current BGR frame and the derived
-HandState, and draws everything back onto that frame.
-"""
-
 import random
+import time
+
 import cv2
-import config, entities, svg_loader
+import numpy as np
 
-PHASE_DEBRIS = "debris"
-PHASE_PREDATOR = "predator"
-PHASE_FEEDING = "feeding"
-PHASE_DONE = "done"
+import config
+import svg_loader
 
-PHASE_ORDER = [PHASE_DEBRIS, PHASE_PREDATOR, PHASE_FEEDING, PHASE_DONE]
-
-PHASE_TITLES = {
-    PHASE_DEBRIS: "Phase 1: Clear the debris - pinch and grab each item",
-    PHASE_PREDATOR: "Phase 2: Push the predator away - open palm, push forward",
-    PHASE_FEEDING: "Phase 3: Feed the assets with the matching finger",
-    PHASE_DONE: "Great job! Game complete.",
-}
-
-
-class Entity:
-    """(kept here only as a type reference; real class lives in entities.py)"""
-
+from entities import (
+Entity,
+spawn_debris,
+spawn_predator,
+spawn_feed_fish,
+spawn_decor_fish,
+)
 
 class Game:
-    def __init__(self, frame_w: int, frame_h: int):
+
+    # Speech name -> actual debris asset/entity name
+    DEBRIS_NAMES = {
+        "apple": "apple_trash",
+        "banana": "banana_trash",
+        "soda": "soda_trash",
+        "bones": "bones_trash",
+    }
+
+    def __init__(self, frame_w, frame_h):
+
         self.frame_w = frame_w
         self.frame_h = frame_h
 
-        self.phase = PHASE_DEBRIS
-        self.score = 0
-        self.phase_progress = 0  # correct actions within the current phase
+        self.phase = "debris"
 
-        self.active = []          # entities currently on screen for the active phase
-        self.decor = []           # purely decorative assets, present throughout
-        self._cooldowns = {}      # id(entity) -> frames remaining before it can score again
-        self._grab_hold = {}      # id(entity) -> consecutive pinch+overlap frame count
-        self._finger_cooldown = {f: 0 for f in config.FINGER_FISH_MAP}
+        self.debris_score = 0
+        self.predator_score = 0
+        self.feeding_score = 0
 
-        self._spawn_decor()
-        self._refill_active()
-
-    # ------------------------------------------------------------------
-    # Spawning helpers
-    # ------------------------------------------------------------------
-    def _spawn_decor(self):
-        for name in config.DECORATIVE_FISH:
-            for _ in range(2):
-                self.decor.append(entities.spawn_decor_fish(self.frame_w, self.frame_h, name))
-
-    def _refill_active(self):
-        if self.phase == PHASE_DEBRIS:
-            while len(self.active) < min(config.MAX_DEBRIS_ON_SCREEN,
-                                          config.DEBRIS_TARGET - self.phase_progress):
-                self.active.append(entities.spawn_debris(self.frame_w, self.frame_h))
-        elif self.phase == PHASE_PREDATOR:
-            while len(self.active) < min(config.MAX_PREDATORS_ON_SCREEN,
-                                          config.PREDATOR_TARGET - self.phase_progress):
-                self.active.append(entities.spawn_predator(self.frame_w, self.frame_h))
-        elif self.phase == PHASE_FEEDING:
-            colors = list(config.FINGER_FISH_MAP.values())
-            while len(self.active) < min(config.MAX_FEED_FISH_ON_SCREEN,
-                                          config.FEEDING_TARGET - self.phase_progress):
-                name = random.choice(colors)
-                self.active.append(entities.spawn_feed_fish(self.frame_w, self.frame_h, name))
-
-    def _advance_phase(self):
-        idx = PHASE_ORDER.index(self.phase)
-        self.phase = PHASE_ORDER[min(idx + 1, len(PHASE_ORDER) - 1)]
-        self.phase_progress = 0
         self.active = []
-        self._grab_hold.clear()
-        self._cooldowns.clear()
-        if self.phase != PHASE_DONE:
-            self._refill_active()
+        self.decor = []
 
-    def _score_point(self):
-        self.score += 1
-        self.phase_progress += 1
-        target = {
-            PHASE_DEBRIS: config.DEBRIS_TARGET,
-            PHASE_PREDATOR: config.PREDATOR_TARGET,
-            PHASE_FEEDING: config.FEEDING_TARGET,
-        }.get(self.phase)
-        if target is not None and self.phase_progress >= target:
-            self._advance_phase()
+        self.predator = None
 
-    # ------------------------------------------------------------------
-    # Per-phase update logic
-    # ------------------------------------------------------------------
-    def _update_debris(self, hand_state):
-        for ent in list(self.active):
-            eid = id(ent)
-            self._grab_hold.setdefault(eid, 0)
-            overlapping = hand_state.present and hand_state.is_pinching and \
-                ent.contains(*hand_state.pinch_point)
-            if overlapping:
-                self._grab_hold[eid] += 1
-            else:
-                self._grab_hold[eid] = 0
+        # This is the debris currently activated by speech.
+        self.spoken_target_name = None
 
-            if self._grab_hold[eid] >= config.GRAB_HOLD_FRAMES:
-                self.active.remove(ent)
-                self._grab_hold.pop(eid, None)
-                self._score_point()
-                self._refill_active()
+        # Warning message for predator movement.
+        self.movement_warning_until = 0
+        self.last_warning_time = 0
 
-    def _update_predator(self, hand_state):
-        for ent in list(self.active):
-            eid = id(ent)
-            self._cooldowns[eid] = max(0, self._cooldowns.get(eid, 0) - 1)
+        self.assets = {}
 
-            can_score = self._cooldowns[eid] == 0
-            pushing = (
-                hand_state.present
-                and hand_state.is_palm_open
-                and hand_state.palm_speed > config.PALM_PUSH_SPEED_PX
-                and ent.contains(*hand_state.palm_center)
+        self._load_assets()
+
+        self._spawn_decorative_fish()
+        self._fill_debris()
+
+    # =========================================================
+    # ASSETS
+    # =========================================================
+
+    def _load_assets(self):
+
+        names = [
+            "banana_trash",
+            "soda_trash",
+            "apple_trash",
+            "bones_trash",
+            "shark_predator",
+            "blue_fish",
+            "green_fish",
+            "pink_fish",
+            "yellow_fish",
+        ]
+
+        for name in names:
+
+            try:
+
+                if name == "shark_predator":
+                    size = config.PREDATOR_SIZE
+
+                elif name in config.DECORATIVE_FISH:
+                    size = config.DECOR_FISH_SIZE
+
+                elif name in config.FINGER_FISH_MAP.values():
+                    size = config.FISH_SIZE
+
+                else:
+                    size = config.TRASH_SIZE
+
+                self.assets[name] = svg_loader.load_asset(
+                    name,
+                    size
+                )
+
+            except FileNotFoundError:
+
+                print(
+                    "Missing asset:",
+                    name
+                )
+
+    # =========================================================
+    # SPAWNING
+    # =========================================================
+
+    def _spawn_decorative_fish(self):
+
+        for name in config.DECORATIVE_FISH:
+
+            try:
+
+                self.decor.append(
+                    spawn_decor_fish(
+                        self.frame_w,
+                        self.frame_h,
+                        name
+                    )
+                )
+
+            except Exception as e:
+
+                print(
+                    "Could not spawn decorative fish:",
+                    e
+                )
+
+    def _fill_debris(self):
+
+        while (
+            len(self.active)
+            < config.MAX_DEBRIS_ON_SCREEN
+        ):
+
+            self.active.append(
+                spawn_debris(
+                    self.frame_w,
+                    self.frame_h
+                )
             )
-            if pushing and can_score:
-                self.active.remove(ent)
-                self._cooldowns.pop(eid, None)
-                self._score_point()
-                self._refill_active()
 
-    def _update_feeding(self, hand_state):
-        for finger in self._finger_cooldown:
-            self._finger_cooldown[finger] = max(0, self._finger_cooldown[finger] - 1)
+    def _spawn_predator(self):
 
-        if not hand_state.present:
+        self.predator = spawn_predator(
+            self.frame_w,
+            self.frame_h
+        )
+
+    def _spawn_feeding_fish(self):
+
+        self.active.clear()
+
+        fish_names = []
+
+        for name in config.FINGER_FISH_MAP.values():
+
+            if name in self.assets and name not in fish_names:
+                fish_names.append(name)
+
+        for name in fish_names:
+
+            if (
+                len(self.active)
+                >= config.MAX_FEED_FISH_ON_SCREEN
+            ):
+                break
+
+            self.active.append(
+                spawn_feed_fish(
+                    self.frame_w,
+                    self.frame_h,
+                    name
+                )
+            )
+
+        self.decor.clear()
+
+        for name in config.DECORATIVE_FISH:
+
+            try:
+
+                self.decor.append(
+                    spawn_decor_fish(
+                        self.frame_w,
+                        self.frame_h,
+                        name
+                    )
+                )
+
+            except Exception as e:
+
+                print(
+                    "Could not spawn decorative fish:",
+                    e
+                )
+
+    # =========================================================
+    # UPDATE
+    # =========================================================
+
+    def update(
+        self,
+        hand_state,
+        speech_state
+    ):
+
+        # Move decorative fish.
+        for fish in self.decor:
+
+            fish.step(
+                self.frame_w,
+                self.frame_h
+            )
+
+        if self.phase == "debris":
+
+            self._update_debris(
+                hand_state,
+                speech_state
+            )
+
+        elif self.phase == "predator":
+
+            self._update_predator(
+                hand_state
+            )
+
+        elif self.phase == "feeding":
+
+            self._update_feeding(
+                hand_state
+            )
+
+    # =========================================================
+    # DEBRIS PHASE
+    # =========================================================
+
+    def _update_debris(
+        self,
+        hand_state,
+        speech_state
+    ):
+
+        # Move debris.
+        for ent in self.active:
+
+            ent.step(
+                self.frame_w,
+                self.frame_h
+            )
+
+        recognized = speech_state.get(
+            "recognized_object"
+        )
+
+        # -----------------------------------------------------
+        # A new correct word was spoken.
+        # -----------------------------------------------------
+
+        if recognized in self.DEBRIS_NAMES:
+
+            target_name = self.DEBRIS_NAMES[
+                recognized
+            ]
+
+            # Check whether that type actually exists.
+            target_exists = any(
+                ent.name == target_name
+                for ent in self.active
+            )
+
+            if target_exists:
+
+                self.spoken_target_name = target_name
+
+        # -----------------------------------------------------
+        # If we don't have an activated target,
+        # the player cannot pick anything up.
+        # -----------------------------------------------------
+
+        if self.spoken_target_name is None:
             return
 
-        for finger, target_name in config.FINGER_FISH_MAP.items():
-            if self._finger_cooldown[finger] > 0:
-                continue
-            tip = hand_state.finger_tips.get(finger)
-            if tip is None:
-                continue
-            for ent in list(self.active):
-                if ent.name != target_name:
-                    continue
-                if ent.contains(*tip):
-                    self.active.remove(ent)
-                    self._finger_cooldown[finger] = config.TAP_COOLDOWN_FRAMES
-                    self._score_point()
-                    self._refill_active()
-                    break
+        target = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def update(self, hand_state):
         for ent in self.active:
-            ent.step(self.frame_w, self.frame_h)
-        for ent in self.decor:
-            ent.step(self.frame_w, self.frame_h)
 
-        if self.phase == PHASE_DEBRIS:
-            self._update_debris(hand_state)
-        elif self.phase == PHASE_PREDATOR:
-            self._update_predator(hand_state)
-        elif self.phase == PHASE_FEEDING:
-            self._update_feeding(hand_state)
+            if (
+                ent.name
+                == self.spoken_target_name
+            ):
+
+                target = ent
+                break
+
+        # The target disappeared somehow.
+        if target is None:
+
+            self.spoken_target_name = None
+
+            return
+
+        # -----------------------------------------------------
+        # Either hand can pinch the activated debris.
+        # -----------------------------------------------------
+
+        for hand in hand_state.hands:
+
+            if not hand.present:
+                continue
+
+            if not hand.is_pinching:
+                continue
+
+            if hand.pinch_point is None:
+                continue
+
+            px, py = hand.pinch_point
+
+            if target.contains(px, py):
+
+                self.active.remove(target)
+
+                target.alive = False
+
+                self.debris_score += 1
+
+                # IMPORTANT:
+                # Remove the halo too.
+                self.spoken_target_name = None
+
+                # Refill the screen.
+                self._fill_debris()
+
+                # Move to predator phase.
+                if (
+                    self.debris_score
+                    >= config.DEBRIS_TARGET
+                ):
+
+                    self.phase = "predator"
+
+                    self.active.clear()
+
+                    self._spawn_predator()
+
+                break
+
+    # =========================================================
+    # PREDATOR PHASE
+    # =========================================================
+
+    def _update_predator(
+        self,
+        hand_state
+    ):
+
+        if self.predator is None:
+
+            self._spawn_predator()
+
+            return
+
+        predator = self.predator
+
+        # -----------------------------------------------------
+        # Move predator.
+        #
+        # We intentionally DO NOT use Entity.step()
+        # because Entity.step() keeps objects inside the frame.
+        # The predator needs to leave the frame.
+        # -----------------------------------------------------
+
+        predator.x += predator.vx
+        predator.y += predator.vy
+
+        # Keep vertical movement inside the screen.
+        if (
+            predator.y < predator.radius
+            or predator.y
+            > self.frame_h - predator.radius
+        ):
+
+            predator.vy *= -1
+
+        # -----------------------------------------------------
+        # Detect a correct palm push.
+        # -----------------------------------------------------
+
+        pushed = False
+
+        for hand in hand_state.hands:
+
+            if not hand.present:
+                continue
+
+            if hand.palm_center is None:
+                continue
+
+            # A push should use an open palm.
+            if not hand.is_palm_open:
+                continue
+
+            # The palm needs to move quickly enough.
+            if (
+                hand.palm_speed
+                < config.PALM_PUSH_SPEED_PX
+            ):
+                continue
+
+            hx, hy = hand.palm_center
+
+            distance = (
+                (hx - predator.x) ** 2
+                + (hy - predator.y) ** 2
+            ) ** 0.5
+
+            if (
+                distance
+                <= predator.radius + 100
+            ):
+
+                pushed = True
+
+                # Direction from hand -> shark.
+                dx = predator.x - hx
+                dy = predator.y - hy
+
+                length = max(
+                    (dx * dx + dy * dy) ** 0.5,
+                    1
+                )
+
+                # Strong push.
+                push_strength = 45
+
+                predator.x += (
+                    dx / length
+                ) * push_strength
+
+                predator.y += (
+                    dy / length
+                ) * push_strength
+
+                self.predator_score += 1
+
+                # Don't show wrong-movement message.
+                self.movement_warning_until = 0
+
+                break
+
+        # -----------------------------------------------------
+        # WRONG MOVEMENT MESSAGE
+        # -----------------------------------------------------
+
+        if not pushed:
+
+            now = time.time()
+
+            # Don't flash it constantly.
+            if (
+                now - self.last_warning_time
+                > 1.0
+            ):
+
+                # Only show it when there is a hand present.
+                if any(
+                    hand.present
+                    for hand in hand_state.hands
+                ):
+
+                    self.movement_warning_until = (
+                        now + 1.0
+                    )
+
+                    self.last_warning_time = now
+
+        # -----------------------------------------------------
+        # Has shark completely left the screen?
+        # -----------------------------------------------------
+
+        completely_left = (
+            predator.x
+            < -predator.size
+            or
+            predator.x
+            > self.frame_w + predator.size
+            or
+            predator.y
+            < -predator.size
+            or
+            predator.y
+            > self.frame_h + predator.size
+        )
+
+        if completely_left:
+
+            self.predator = None
+
+            # Continue predator phase until target reached.
+            if (
+                self.predator_score
+                >= config.PREDATOR_TARGET
+            ):
+
+                self.phase = "feeding"
+
+                self._spawn_feeding_fish()
+
+            else:
+
+                self._spawn_predator()
+
+    # =========================================================
+    # FEEDING
+    # =========================================================
+
+    def _update_feeding(
+        self,
+        hand_state
+    ):
+
+        for fish in self.active:
+
+            fish.step(
+                self.frame_w,
+                self.frame_h
+            )
+
+        for hand in hand_state.hands:
+
+            if not hand.present:
+                continue
+
+            for finger_name, point in hand.finger_tips.items():
+
+                if point is None:
+                    continue
+
+                fish_name = (
+                    config.FINGER_FISH_MAP.get(
+                        finger_name
+                    )
+                )
+
+                if fish_name is None:
+                    continue
+
+                for fish in self.active:
+
+                    if fish.name != fish_name:
+                        continue
+
+                    if fish.contains(
+                        point[0],
+                        point[1]
+                    ):
+
+                        fish.alive = False
+
+                        self.active.remove(
+                            fish
+                        )
+
+                        self.feeding_score += 1
+
+                        break
+
+        # Keep fish present.
+        available = [
+            name
+            for name in config.FINGER_FISH_MAP.values()
+            if name in self.assets
+        ]
+
+        while (
+            available
+            and
+            len(self.active)
+            < min(
+                config.MAX_FEED_FISH_ON_SCREEN,
+                len(available)
+            )
+        ):
+
+            name = random.choice(
+                available
+            )
+
+            self.active.append(
+                spawn_feed_fish(
+                    self.frame_w,
+                    self.frame_h,
+                    name
+                )
+            )
+
+        if (
+            self.feeding_score
+            >= config.FEEDING_TARGET
+        ):
+
+            self.phase = "complete"
+
+    # =========================================================
+    # DRAW
+    # =========================================================
 
     def draw(self, frame):
-        for ent in self.decor:
-            sprite = svg_loader.load_asset(ent.name, ent.size)
-            svg_loader.overlay_bgra(frame, sprite, int(ent.x), int(ent.y))
+
+        # -----------------------------------------------------
+        # Decorative fish
+        # -----------------------------------------------------
+
+        for fish in self.decor:
+
+            self._draw_entity(
+                frame,
+                fish
+            )
+
+        # -----------------------------------------------------
+        # Debris
+        # -----------------------------------------------------
+
         for ent in self.active:
-            sprite = svg_loader.load_asset(ent.name, ent.size)
-            svg_loader.overlay_bgra(frame, sprite, int(ent.x), int(ent.y))
+
+            # Draw halo FIRST.
+            #
+            # This makes it appear behind the debris.
+            if (
+                self.phase == "debris"
+                and
+                ent.name
+                == self.spoken_target_name
+            ):
+
+                self._draw_halo(
+                    frame,
+                    ent
+                )
+
+            # Then draw debris on top.
+            self._draw_entity(
+                frame,
+                ent
+            )
+
+        # -----------------------------------------------------
+        # Predator
+        # -----------------------------------------------------
+
+        if (
+            self.phase == "predator"
+            and
+            self.predator is not None
+        ):
+
+            self._draw_entity(
+                frame,
+                self.predator
+            )
+
+        # -----------------------------------------------------
+        # HUD
+        # -----------------------------------------------------
+
         self._draw_hud(frame)
 
-    def _draw_hud(self, frame):
-        cv2.rectangle(frame, (0, 0), (self.frame_w, 70), (20, 20, 20), -1)
-        cv2.putText(
-            frame, PHASE_TITLES[self.phase], (16, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, config.HUD_FONT_SCALE * 0.7,
-            (255, 255, 255), 2, cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame, f"Score: {self.score} / {config.SCORE_TARGET}", (16, 58),
-            cv2.FONT_HERSHEY_SIMPLEX, config.HUD_FONT_SCALE * 0.6,
-            (0, 220, 255), 2, cv2.LINE_AA,
-        )
-        if self.phase == PHASE_DONE:
-            text = "GAME COMPLETE - press Q to quit"
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-            x = (self.frame_w - tw) // 2
-            y = (self.frame_h + th) // 2
-            cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                        (0, 255, 120), 3, cv2.LINE_AA)
+        # -----------------------------------------------------
+        # Movement warning
+        # -----------------------------------------------------
 
-    @property
-    def is_done(self) -> bool:
-        return self.phase == PHASE_DONE
+        if (
+            time.time()
+            < self.movement_warning_until
+        ):
+
+            text = (
+                "You're not doing the right movement!"
+            )
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+
+            scale = 0.45
+            thickness = 1
+
+            (text_w, text_h), _ = (
+                cv2.getTextSize(
+                    text,
+                    font,
+                    scale,
+                    thickness
+                )
+            )
+
+            margin = 20
+
+            x = (
+                self.frame_w
+                - text_w
+                - margin
+            )
+
+            y = (
+                self.frame_h
+                - margin
+            )
+
+            cv2.putText(
+                frame,
+                text,
+                (x, y),
+                font,
+                scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA
+            )
+
+    # =========================================================
+    # HALO
+    # =========================================================
+
+    def _draw_halo(
+        self,
+        frame,
+        ent
+    ):
+
+        # Create a soft-looking halo using several circles.
+        center = (
+            int(ent.x),
+            int(ent.y)
+        )
+
+        radius = int(
+            ent.size * 0.62
+        )
+
+        # Outer glow.
+        cv2.circle(
+            frame,
+            center,
+            radius + 12,
+            (0, 255, 255),
+            8,
+            cv2.LINE_AA
+        )
+
+        # Inner glow.
+        cv2.circle(
+            frame,
+            center,
+            radius,
+            (0, 255, 255),
+            4,
+            cv2.LINE_AA
+        )
+
+    # =========================================================
+    # ENTITY DRAWING
+    # =========================================================
+
+    def _draw_entity(
+        self,
+        frame,
+        ent
+    ):
+
+        if not ent.alive:
+            return
+
+        image = self.assets.get(
+            ent.name
+        )
+
+        if image is None:
+            return
+
+        # Entity x/y are CENTER coordinates.
+        x = int(
+            ent.x - ent.size / 2
+        )
+
+        y = int(
+            ent.y - ent.size / 2
+        )
+
+        svg_loader.overlay_bgra(
+            frame,
+            image,
+            x,
+            y
+        )
+
+    # =========================================================
+    # HUD
+    # =========================================================
+
+    def _draw_hud(self, frame):
+
+        if self.phase == "debris":
+
+            text = (
+                f"Clean the water: "
+                f"{self.debris_score}/"
+                f"{config.DEBRIS_TARGET}"
+            )
+
+        elif self.phase == "predator":
+
+            text = (
+                f"Push the predator away: "
+                f"{self.predator_score}/"
+                f"{config.PREDATOR_TARGET}"
+            )
+
+        elif self.phase == "feeding":
+
+            text = (
+                f"Feed the fish: "
+                f"{self.feeding_score}/"
+                f"{config.FEEDING_TARGET}"
+            )
+
+        else:
+
+            text = (
+                "Rehabilitation complete!"
+            )
+
+        cv2.putText(
+            frame,
+            text,
+            (20, self.frame_h - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+

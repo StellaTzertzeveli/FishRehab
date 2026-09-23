@@ -12,8 +12,7 @@ from hand_tracker import HandTracker
 
 def main():
     cap = cv2.VideoCapture(config.CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
+    cap.set(2000, 2400)
 
     if not cap.isOpened():
         raise RuntimeError(
@@ -27,7 +26,8 @@ def main():
     frame_h, frame_w = frame.shape[:2]
 
     background = svg_loader.load_background(frame_w, frame_h)
-    tracker = HandTracker(frame_w, frame_h, max_hands=1)
+    background = cv2.cvtColor(background, cv2.COLOR_BGRA2BGR)
+    tracker = HandTracker(frame_w, frame_h, max_hands=2)
     game = Game(frame_w, frame_h)
 
     cv2.namedWindow(config.WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -36,7 +36,7 @@ def main():
         while True:
             ok, frame = cap.read()
             if not ok:
-                break
+                raise RuntimeError("Camera opened but returned nada! no frame.")
             if config.MIRROR_CAMERA:
                 frame = cv2.flip(frame, 1)
 

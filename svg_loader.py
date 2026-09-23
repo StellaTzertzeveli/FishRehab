@@ -1,142 +1,290 @@
 """
-Loads .png assets as BGR/BGRA numpy arrays (OpenCV's native layout)
-so they can be composited onto camera frames.
+Loads the underwater background and game assets.
+
+The game uses:
+    load_background()  - loads the underwater PNG
+    load_asset()       - loads individual PNG/SVG game assets
+    overlay_bgra()     - alpha-blends an asset onto the camera frame
 """
 
 import os
+
 import cv2
 import numpy as np
-import config
 
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+
+
+# Cache loaded images so we don't reload them every frame
 _cache = {}
 
 
+# ------------------------------------------------------------
+# Background
+# ------------------------------------------------------------
+
 def load_background(width_px: int, height_px: int) -> np.ndarray:
-    """Load and resize the underwater PNG background."""
-    key = ("underwater_background", (width_px, height_px))
+    """Load and resize the underwater background."""
+
+    key = ("background", width_px, height_px)
 
     if key in _cache:
-        return _cache[key]
+        return _cache[key].copy()
 
-    filename = config.ASSET_FILES["underwater_background"]
-    png_path = os.path.join(config.ASSET_DIR, filename)
-
-    if not os.path.isfile(png_path):
-        raise FileNotFoundError(f"Missing background asset: {png_path}")
-
-    # Load PNG using OpenCV.
-    img = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
-
-    if img is None:
-        raise ValueError(f"Could not load background asset: {png_path}")
-
-    # Backgrounds are expected to be opaque.
-    # If the PNG happens to contain an alpha channel, discard it.
-    if img.ndim == 3 and img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-    # Resize to requested dimensions.
-    img = cv2.resize(
-        img,
-        (width_px, height_px),
-        interpolation=cv2.INTER_LINEAR,
+    png_path = os.path.join(
+        ASSETS_DIR,
+        "underwater_background.png"
     )
 
-    _cache[key] = img
-    return img
-
-
-def load_sprite(filename: str) -> np.ndarray:
-    """
-    Load a PNG sprite as BGRA.
-
-    PNGs with no alpha channel are converted to BGRA with
-    a fully opaque alpha channel.
-    """
-    key = ("sprite", filename)
-
-    if key in _cache:
-        return _cache[key]
-
-    png_path = os.path.join(config.ASSET_DIR, filename)
-
-    if not os.path.isfile(png_path):
-        raise FileNotFoundError(f"Missing sprite asset: {png_path}")
-
-    sprite = cv2.imread(png_path, cv2.IMREAD_UNCHANGED)
-
-    if sprite is None:
-        raise ValueError(f"Could not load sprite asset: {png_path}")
-
-    if sprite.ndim == 2:
-        # Grayscale -> BGRA
-        sprite = cv2.cvtColor(sprite, cv2.COLOR_GRAY2BGRA)
-
-    elif sprite.shape[2] == 3:
-        # BGR -> BGRA with fully opaque alpha
-        sprite = cv2.cvtColor(sprite, cv2.COLOR_BGR2BGRA)
-
-    elif sprite.shape[2] != 4:
-        raise ValueError(
-            f"Unexpected PNG channel count ({sprite.shape[2]}): {png_path}"
+    if not os.path.exists(png_path):
+        raise FileNotFoundError(
+            f"Missing background asset: {png_path}"
         )
 
-    _cache[key] = sprite
-    return sprite
+    image = cv2.imread(
+        png_path,
+        cv2.IMREAD_UNCHANGED
+    )
 
+    if image is None:
+        raise RuntimeError(
+            f"Could not load background asset: {png_path}"
+        )
+
+    image = cv2.resize(
+        image,
+        (width_px, height_px),
+        interpolation=cv2.INTER_AREA
+    )
+
+    # Make sure the background is BGRA
+    if image.ndim == 2:
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_GRAY2BGRA
+        )
+
+    elif image.shape[2] == 3:
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2BGRA
+        )
+
+    _cache[key] = image
+
+    return image.copy()
+
+
+# ------------------------------------------------------------
+# Game assets
+# ------------------------------------------------------------
+
+def load_asset(name: str, size) -> np.ndarray:
+    """
+    Load a game asset and resize it.
+
+    The game passes either:
+        size = 80
+    or:
+        size = (80, 100)
+
+    PNG is preferred. SVG is supported as a fallback.
+    """
+
+    # The existing game passes an integer size
+    if isinstance(size, (int, float)):
+        width = int(size)
+        height = int(size)
+
+    # Also support (width, height)
+    else:
+        width, height = map(int, size)
+
+    key = ("asset", name, width, height)
+
+    if key in _cache:
+        return _cache[key].copy()
+
+    # --------------------------------------------------------
+    # Find the asset
+    # --------------------------------------------------------
+
+    png_path = os.path.join(
+        ASSETS_DIR,
+        f"{name}.png"
+    )
+
+    svg_path = os.path.join(
+        ASSETS_DIR,
+        f"{name}.svg"
+    )
+
+    image = None
+
+    # Try PNG first
+    if os.path.exists(png_path):
+
+        image = cv2.imread(
+            png_path,
+            cv2.IMREAD_UNCHANGED
+        )
+
+        if image is None:
+            raise RuntimeError(
+                f"Could not read PNG asset: {png_path}"
+            )
+
+    # If there is no PNG, try SVG
+    elif os.path.exists(svg_path):
+
+        try:
+            import cairosvg
+        except ImportError:
+            raise ImportError(
+                "cairosvg is required for SVG assets. "
+                "Install it with: pip install cairosvg"
+            )
+
+        png_bytes = cairosvg.svg2png(
+            url=svg_path
+        )
+
+        image_array = np.frombuffer(
+            png_bytes,
+            dtype=np.uint8
+        )
+
+        image = cv2.imdecode(
+            image_array,
+            cv2.IMREAD_UNCHANGED
+        )
+
+        if image is None:
+            raise RuntimeError(
+                f"Could not read SVG asset: {svg_path}"
+            )
+
+    # Neither exists
+    else:
+        raise FileNotFoundError(
+            f"Could not find asset '{name}'. "
+            f"Expected either:\n"
+            f"  {png_path}\n"
+            f"or\n"
+            f"  {svg_path}"
+        )
+
+    # --------------------------------------------------------
+    # Convert to BGRA
+    # --------------------------------------------------------
+
+    if image.ndim == 2:
+
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_GRAY2BGRA
+        )
+
+    elif image.shape[2] == 3:
+
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2BGRA
+        )
+
+    # --------------------------------------------------------
+    # Resize
+    # --------------------------------------------------------
+
+    image = cv2.resize(
+        image,
+        (width, height),
+        interpolation=cv2.INTER_AREA
+    )
+
+    _cache[key] = image
+
+    return image.copy()
+
+
+# ------------------------------------------------------------
+# Alpha overlay
+# ------------------------------------------------------------
 
 def overlay_bgra(
-    frame_bgr: np.ndarray,
-    sprite_bgra: np.ndarray,
-    cx: int,
-    cy: int,
-) -> None:
+    frame: np.ndarray,
+    overlay: np.ndarray,
+    x: int,
+    y: int
+):
     """
-    Alpha-composite `sprite_bgra` onto `frame_bgr` centered at (cx, cy).
+    Draw a BGRA image onto a BGR frame.
 
-    Modifies frame_bgr in place and silently clips the sprite at
-    the frame edges.
+    x and y specify the top-left corner of the asset.
     """
-    h, w = sprite_bgra.shape[:2]
 
-    # Sprite position in the destination frame.
-    x0 = cx - w // 2
-    y0 = cy - h // 2
-    x1 = x0 + w
-    y1 = y0 + h
-
-    # Frame dimensions.
-    fh, fw = frame_bgr.shape[:2]
-
-    # Source crop coordinates.
-    sx0 = max(0, -x0)
-    sy0 = max(0, -y0)
-    sx1 = w - max(0, x1 - fw)
-    sy1 = h - max(0, y1 - fh)
-
-    # Destination coordinates.
-    dx0 = max(0, x0)
-    dy0 = max(0, y0)
-    dx1 = min(fw, x1)
-    dy1 = min(fh, y1)
-
-    # Completely off-screen.
-    if sx1 <= sx0 or sy1 <= sy0 or dx1 <= dx0 or dy1 <= dy0:
+    if overlay is None:
         return
 
-    sprite_crop = sprite_bgra[sy0:sy1, sx0:sx1]
-    background_crop = frame_bgr[dy0:dy1, dx0:dx1]
+    h, w = overlay.shape[:2]
 
-    # Alpha channel: 0 = transparent, 255 = opaque.
-    alpha = sprite_crop[:, :, 3:4].astype(np.float32) / 255.0
+    frame_h, frame_w = frame.shape[:2]
 
-    foreground = sprite_crop[:, :, :3].astype(np.float32)
-    background = background_crop.astype(np.float32)
+    # --------------------------------------------------------
+    # Work out visible area
+    # --------------------------------------------------------
 
-    # Alpha compositing.
+    x1 = max(0, x)
+    y1 = max(0, y)
+
+    x2 = min(frame_w, x + w)
+    y2 = min(frame_h, y + h)
+
+    # Asset is completely outside the frame
+    if x1 >= x2 or y1 >= y2:
+        return
+
+    # --------------------------------------------------------
+    # Corresponding area inside the asset
+    # --------------------------------------------------------
+
+    ox1 = x1 - x
+    oy1 = y1 - y
+
+    ox2 = ox1 + (x2 - x1)
+    oy2 = oy1 + (y2 - y1)
+
+    overlay_crop = overlay[oy1:oy2, ox1:ox2]
+    frame_crop = frame[y1:y2, x1:x2]
+
+    # --------------------------------------------------------
+    # Alpha blending
+    # --------------------------------------------------------
+
+    alpha = (
+        overlay_crop[:, :, 3].astype(np.float32)
+        / 255.0
+    )
+
+    alpha = alpha[:, :, np.newaxis]
+
+    foreground = overlay_crop[:, :, :3].astype(
+        np.float32
+    )
+
+    background = frame_crop.astype(
+        np.float32
+    )
+
     blended = (
         foreground * alpha
         + background * (1.0 - alpha)
     )
 
-    frame_bgr[dy0:dy1, dx0:dx1] = blended.astype(np.uint8)
+    frame_crop[:] = blended.astype(np.uint8)
