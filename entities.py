@@ -1,8 +1,6 @@
-
 import random
 from dataclasses import dataclass, field
 import config
-
 
 @dataclass
 class Entity:
@@ -19,7 +17,7 @@ class Entity:
         return self.size // 2
 
     def step(self, frame_w: int, frame_h: int) -> None:
-        """Advance position and bounce softly off frame edges."""
+        #Advance position and bounce off frame edges.
         self.x += self.vx
         self.y += self.vy
         margin = self.radius

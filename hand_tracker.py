@@ -155,10 +155,6 @@ class HandTracker:
             landmark.y * self.frame_h,
         )
 
-    # ========================================================
-    # PROCESS ONE HAND
-    # ========================================================
-
     def _process_hand(
         self,
         landmarks,
@@ -166,11 +162,6 @@ class HandTracker:
     ):
 
         state = SingleHandState()
-
-        # --------------------------------
-        # PINCH
-        # --------------------------------
-
         tx, ty = self._px(
             landmarks[THUMB_TIP]
         )
@@ -223,10 +214,6 @@ class HandTracker:
             cy,
         )
 
-        # --------------------------------
-        # PALM SPEED
-        # --------------------------------
-
         previous = (
             self._previous_palm_centers[
                 hand_index
@@ -234,51 +221,18 @@ class HandTracker:
         )
 
         if previous is not None:
-
             dx = cx - previous[0]
             dy = cy - previous[1]
-
-            speed = (
-                dx ** 2
-                +
-                dy ** 2
-            ) ** 0.5
-
-            self._speed_history[
-                hand_index
-            ].append(speed)
+            speed = (dx ** 2 + dy ** 2) ** 0.5
+            self._speed_history[hand_index].append(speed)
 
             state.palm_speed = (
-                sum(
-                    self._speed_history[
-                        hand_index
-                    ]
-                )
-                /
-                len(
-                    self._speed_history[
-                        hand_index
-                    ]
-                )
-            )
+                sum(self._speed_history[hand_index])/len(
+                    self._speed_history[hand_index]))
 
-        self._previous_palm_centers[
-            hand_index
-        ] = (
-            cx,
-            cy,
-        )
-
-        # --------------------------------
-        # OPEN PALM
-        # --------------------------------
-
-        wx, wy = self._px(
-            landmarks[WRIST]
-        )
-
+        self._previous_palm_centers[hand_index] = (cx,cy,)
+        wx, wy = self._px(landmarks[WRIST])
         extended_fingers = 0
-
         for finger in FINGER_TIPS:
 
             tip_x, tip_y = self._px(

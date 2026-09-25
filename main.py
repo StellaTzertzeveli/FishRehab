@@ -1,9 +1,3 @@
-"""
-Controls:
-    Q or ESC  - quit
-    R         - restart
-"""
-
 import cv2
 import config, svg_loader
 from game import Game
@@ -15,10 +9,7 @@ def main():
     cap.set(2000, 2400)
 
     if not cap.isOpened():
-        raise RuntimeError(
-            f"Could not open camera index {config.CAMERA_INDEX}. "
-            "Check that a webcam is connected and not in use by another app."
-        )
+        raise RuntimeError(f"Could not open camera index {config.CAMERA_INDEX}. ")
 
     ok, frame = cap.read()
     if not ok:
@@ -31,7 +22,11 @@ def main():
     game = Game(frame_w, frame_h)
 
     cv2.namedWindow(config.WINDOW_NAME, cv2.WINDOW_NORMAL)
-
+    cv2.setWindowProperty(
+        config.WINDOW_NAME,
+        cv2.WND_PROP_FULLSCREEN,
+        cv2.WINDOW_FULLSCREEN
+    )
     try:
         while True:
             ok, frame = cap.read()
@@ -40,8 +35,6 @@ def main():
             if config.MIRROR_CAMERA:
                 frame = cv2.flip(frame, 1)
 
-            # Blend the camera feed lightly under the pond background so the
-            # scene reads as an aquarium rather than a raw webcam view.
             display = cv2.addWeighted(background, 0.85, frame, 0.15, 0)
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
